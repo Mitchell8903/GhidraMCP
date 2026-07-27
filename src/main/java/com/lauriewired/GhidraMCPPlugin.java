@@ -16,6 +16,9 @@ import ghidra.program.model.pcode.HighSymbol;
 import ghidra.program.model.pcode.LocalSymbolMap;
 import ghidra.program.model.pcode.HighFunctionDBUtil;
 import ghidra.program.model.pcode.HighFunctionDBUtil.ReturnCommitOption;
+import ghidra.app.plugin.core.analysis.AnalysisBackgroundCommand;
+import ghidra.app.plugin.core.analysis.AutoAnalysisManager;
+import ghidra.program.util.GhidraProgramUtilities;
 import ghidra.app.decompiler.DecompInterface;
 import ghidra.app.decompiler.DecompileResults;
 import ghidra.app.plugin.PluginCategoryNames;
@@ -30,6 +33,10 @@ import ghidra.util.exception.DuplicateNameException;
 import ghidra.util.exception.InvalidInputException;
 import ghidra.framework.plugintool.PluginInfo;
 import ghidra.framework.plugintool.util.PluginStatus;
+import ghidra.framework.model.DomainFile;
+import ghidra.framework.model.DomainFolder;
+import ghidra.framework.model.Project;
+import ghidra.framework.model.ProjectData;
 import ghidra.program.util.ProgramLocation;
 import ghidra.util.Msg;
 import ghidra.util.task.ConsoleTaskMonitor;
@@ -57,6 +64,7 @@ import java.net.URLDecoder;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
 
 @PluginInfo(
     status = PluginStatus.RELEASED,
@@ -68,9 +76,23 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class GhidraMCPPlugin extends Plugin {
 
     private HttpServer server;
-    // Name of the program the MCP tools should operate on, chosen via /use_program.
-    // null => fall back to the tool's GUI-current program (original behaviour).
+    // Name (or project path) of the program the MCP tools should operate on, chosen
+    // via /use_program. null => fall back to the tool's GUI-current program.
     private volatile String selectedProgramName = null;
+    // Project paths of programs this plugin opened itself (hidden, i.e. not shown in
+    // the GUI's program list) so /close_program knows what it is allowed to close.
+    private final Set<String> hiddenOpenedPaths = Collections.synchronizedSet(new LinkedHashSet<>());
+    // Project path -> auto-analysis run kicked off via /analyze_program.
+    private final Map<String, AnalysisRun> analysisStarts = Collections.synchronizedMap(new HashMap<>());
+    // How long after queueing an analysis it may still report as not-yet-running.
+    private static final long STARTUP_GRACE_MS = 10_000;
+
+    /** Bookkeeping for one auto-analysis run, so status can report elapsed time. */
+    private static class AnalysisRun {
+        final long start = System.currentTimeMillis();
+        volatile long end = 0;
+        volatile boolean sawRunning = false;
+    }
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
     private static final String PORT_OPTION_NAME = "Server Port";
     private static final int DEFAULT_PORT = 8080;
@@ -227,6 +249,27 @@ public class GhidraMCPPlugin extends Plugin {
 
         server.createContext("/get_current_program", exchange -> {
             sendResponse(exchange, getCurrentProgramInfo());
+        });
+
+        server.createContext("/analyze_program", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendResponse(exchange, analyzeProgram(qparams.get("name"),
+                Boolean.parseBoolean(qparams.get("force"))));
+        });
+
+        server.createContext("/analysis_status", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendResponse(exchange, analysisStatus(qparams.get("name")));
+        });
+
+        server.createContext("/save_program", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendResponse(exchange, saveProgram(qparams.get("name")));
+        });
+
+        server.createContext("/close_program", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendResponse(exchange, closeProgram(qparams.get("name")));
         });
 
         server.createContext("/decompile_function", exchange -> {
@@ -1647,22 +1690,32 @@ public class GhidraMCPPlugin extends Plugin {
         if (pm == null) return null;
         String sel = selectedProgramName;
         if (sel != null && !sel.isEmpty()) {
-            for (Program p : pm.getAllOpenPrograms()) {
-                if (programMatches(p, sel)) return p;
+            Program p = findOpenProgram(pm, sel);
+            if (p != null) return p;
+            // Not open (yet, or closed since it was selected): open it from the project
+            // so a selection made with /use_program stays valid for the whole session.
+            DomainFile df = findProgramFile(sel);
+            if (df != null) {
+                p = openProgramHidden(pm, df);
+                if (p != null) return p;
             }
-            // The selected program is no longer open; fall back to the GUI current.
+            Msg.warn(this, "Selected program '" + sel +
+                "' is unavailable; falling back to the tool's current program");
         }
         return pm.getCurrentProgram();
     }
 
-    /** Match an open program by exact name, exact project path, or (last resort)
-     *  a name substring, so callers can use whatever list_programs shows. */
-    private boolean programMatches(Program p, String sel) {
-        if (p.getName().equals(sel)) return true;
-        try {
-            if (p.getDomainFile() != null && p.getDomainFile().getPathname().equals(sel)) return true;
-        } catch (Exception e) { /* ignore */ }
-        return p.getName().contains(sel);
+    private Program findOpenProgram(ProgramManager pm, String sel) {
+        Program[] all = pm.getAllOpenPrograms();
+        if (all == null) return null;
+        // Prefer an exact name/path hit over the substring fallback.
+        for (Program p : all) {
+            if (p.getName().equals(sel) || programPath(p).equals(sel)) return p;
+        }
+        for (Program p : all) {
+            if (p.getName().contains(sel)) return p;
+        }
+        return null;
     }
 
     private String programPath(Program p) {
@@ -1672,45 +1725,307 @@ public class GhidraMCPPlugin extends Plugin {
         return "";
     }
 
-    /** List every open program; the MCP-active one is marked with '*'. */
+    /** Every Program file in the open project, whether or not it is open in the tool. */
+    private List<DomainFile> listProjectProgramFiles() {
+        List<DomainFile> files = new ArrayList<>();
+        Project project = tool.getProject();
+        if (project == null) return files;
+        ProjectData data = project.getProjectData();
+        if (data == null) return files;
+        collectProgramFiles(data.getRootFolder(), files);
+        files.sort(Comparator.comparing(DomainFile::getPathname));
+        return files;
+    }
+
+    private void collectProgramFiles(DomainFolder folder, List<DomainFile> out) {
+        if (folder == null) return;
+        try {
+            for (DomainFile df : folder.getFiles()) {
+                if (Program.class.isAssignableFrom(df.getDomainObjectClass())) {
+                    out.add(df);
+                }
+            }
+            for (DomainFolder sub : folder.getFolders()) {
+                collectProgramFiles(sub, out);
+            }
+        }
+        catch (Exception e) {
+            Msg.error(this, "Error reading project folder " + folder.getPathname(), e);
+        }
+    }
+
+    /** Find a project file by exact path, exact name, or (last resort) a name substring. */
+    private DomainFile findProgramFile(String sel) {
+        List<DomainFile> files = listProjectProgramFiles();
+        for (DomainFile df : files) {
+            if (df.getPathname().equals(sel) || df.getName().equals(sel)) return df;
+        }
+        for (DomainFile df : files) {
+            if (df.getName().contains(sel)) return df;
+        }
+        return null;
+    }
+
+    /**
+     * Open a project file into the tool's ProgramManager without showing it in the GUI.
+     * The ProgramManager owns the program (consumer/undo/save handling stays normal), so
+     * every other endpoint works against it exactly as it does for a visible program.
+     */
+    private Program openProgramHidden(ProgramManager pm, DomainFile df) {
+        AtomicReference<Program> opened = new AtomicReference<>();
+        runOnSwing(() -> {
+            try {
+                opened.set(pm.openProgram(df, DomainFile.DEFAULT_VERSION, ProgramManager.OPEN_HIDDEN));
+            }
+            catch (Exception e) {
+                Msg.error(this, "Failed to open program " + df.getPathname(), e);
+            }
+        });
+        Program p = opened.get();
+        if (p != null) {
+            hiddenOpenedPaths.add(df.getPathname());
+            Msg.info(this, "GhidraMCP opened project program " + df.getPathname());
+        }
+        return p;
+    }
+
+    private void runOnSwing(Runnable r) {
+        if (SwingUtilities.isEventDispatchThread()) {
+            r.run();
+            return;
+        }
+        try {
+            SwingUtilities.invokeAndWait(r);
+        }
+        catch (InterruptedException | InvocationTargetException e) {
+            Msg.error(this, "Swing operation failed", e);
+        }
+    }
+
+    /**
+     * List every program in the project, open or not. The MCP-active one is marked '*';
+     * state is one of open (visible in the GUI), background (opened by MCP, hidden from
+     * the GUI) or closed (in the project only - /use_program will open it on demand).
+     */
     private String listPrograms() {
         ProgramManager pm = tool.getService(ProgramManager.class);
         if (pm == null) return "No program manager available";
-        Program[] all = pm.getAllOpenPrograms();
-        if (all == null || all.length == 0) return "No programs open";
         Program active = getCurrentProgram();
+
         StringBuilder sb = new StringBuilder();
-        for (Program p : all) {
-            sb.append(String.format("%s%s\tlang=%s\tpath=%s%n",
-                p == active ? "* " : "  ",
-                p.getName(),
-                p.getLanguageID().getIdAsString(),
-                programPath(p)));
+        Set<String> listed = new HashSet<>();
+        for (DomainFile df : listProjectProgramFiles()) {
+            Program open = openProgramFor(pm, df);
+            String state = open == null ? "closed"
+                         : (pm.isVisible(open) ? "open" : "background");
+            sb.append(String.format("%s%s\tstate=%s\tlang=%s\tpath=%s%n",
+                open != null && open == active ? "* " : "  ",
+                df.getName(),
+                state,
+                open != null ? open.getLanguageID().getIdAsString() : fileLanguage(df),
+                df.getPathname()));
+            listed.add(df.getPathname());
         }
-        return sb.toString();
+        // Programs open in the tool but not in this project (e.g. opened from a URL).
+        Program[] all = pm.getAllOpenPrograms();
+        if (all != null) {
+            for (Program p : all) {
+                if (listed.contains(programPath(p))) continue;
+                sb.append(String.format("%s%s\tstate=open\tlang=%s\tpath=%s%n",
+                    p == active ? "* " : "  ",
+                    p.getName(), p.getLanguageID().getIdAsString(), programPath(p)));
+            }
+        }
+        return sb.length() == 0 ? "No programs found in the project" : sb.toString();
     }
 
-    /** Choose which open program the other tools operate on. */
+    private Program openProgramFor(ProgramManager pm, DomainFile df) {
+        Program[] all = pm.getAllOpenPrograms();
+        if (all == null) return null;
+        for (Program p : all) {
+            if (programPath(p).equals(df.getPathname())) return p;
+        }
+        return null;
+    }
+
+    /** Language of a program that is not open, read from the file's stored metadata. */
+    private String fileLanguage(DomainFile df) {
+        try {
+            Map<String, String> meta = df.getMetadata();
+            if (meta != null) {
+                String lang = meta.get("Language ID");
+                if (lang != null) return lang;
+            }
+        }
+        catch (Exception e) { /* metadata is best-effort */ }
+        return "?";
+    }
+
+    /**
+     * Choose which program the other tools operate on. If the program is in the project
+     * but not open, it is opened in the background rather than reported as missing.
+     */
     private String useProgram(String name) {
         if (name == null || name.isEmpty()) return "Error: missing 'name' parameter";
         ProgramManager pm = tool.getService(ProgramManager.class);
         if (pm == null) return "No program manager available";
-        for (Program p : pm.getAllOpenPrograms()) {
-            if (programMatches(p, name)) {
-                selectedProgramName = p.getName();   // canonicalise to the exact name
-                pm.setCurrentProgram(p);             // keep the GUI in sync
-                return String.format("Now using program: %s (lang=%s, path=%s)",
-                    p.getName(), p.getLanguageID().getIdAsString(), programPath(p));
+
+        Program p = findOpenProgram(pm, name);
+        boolean wasOpen = p != null;
+        if (p == null) {
+            DomainFile df = findProgramFile(name);
+            if (df == null) {
+                return "Error: no program in the project matches '" + name +
+                    "'. Use list_programs to see options.";
+            }
+            p = openProgramHidden(pm, df);
+            if (p == null) {
+                return "Error: failed to open '" + df.getPathname() +
+                    "'. It may be checked out by another tool, or need an upgrade in the Ghidra GUI.";
             }
         }
-        return "Error: no open program matches '" + name + "'. Use list_programs to see options.";
+        selectedProgramName = p.getName();      // canonicalise to the exact name
+        if (wasOpen && pm.isVisible(p)) {
+            pm.setCurrentProgram(p);            // keep the GUI in sync
+        }
+        return String.format("Now using program: %s (lang=%s, path=%s, %s)",
+            p.getName(), p.getLanguageID().getIdAsString(), programPath(p),
+            wasOpen ? "already open" : "opened from project");
     }
 
     private String getCurrentProgramInfo() {
         Program p = getCurrentProgram();
         if (p == null) return "No program loaded";
-        return String.format("%s\tlang=%s\tpath=%s",
-            p.getName(), p.getLanguageID().getIdAsString(), programPath(p));
+        return String.format("%s\tlang=%s\tpath=%s\tmodified=%s",
+            p.getName(), p.getLanguageID().getIdAsString(), programPath(p), p.isChanged());
+    }
+
+    /**
+     * Resolve a program by name/path for the analysis endpoints: the current selection
+     * when no name is given, otherwise an open program, otherwise a project file that
+     * gets opened in the background.
+     */
+    private Program resolveProgram(ProgramManager pm, String name) {
+        if (name == null || name.isEmpty()) return getCurrentProgram();
+        Program p = findOpenProgram(pm, name);
+        if (p != null) return p;
+        DomainFile df = findProgramFile(name);
+        return df == null ? null : openProgramHidden(pm, df);
+    }
+
+    /**
+     * Run Ghidra's auto-analysis on a program - needed for project files that were
+     * imported but never analyzed, since a background-opened program never triggers the
+     * GUI's "analyze now?" prompt. Analysis is queued as a tool background command (the
+     * same path the GUI's Analyze action uses, so it shows normal progress and can be
+     * cancelled from the GUI) and this returns immediately; poll /analysis_status.
+     */
+    private String analyzeProgram(String name, boolean force) {
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm == null) return "No program manager available";
+        Program p = resolveProgram(pm, name);
+        if (p == null) {
+            return "Error: no program in the project matches '" + name +
+                "'. Use list_programs to see options.";
+        }
+        AutoAnalysisManager mgr = AutoAnalysisManager.getAnalysisManager(p);
+        if (mgr.isAnalyzing()) {
+            return "Analysis is already running on " + p.getName() + "; poll analysis_status.";
+        }
+        if (GhidraProgramUtilities.isAnalyzed(p) && !force) {
+            return p.getName() + " has already been analyzed (" +
+                p.getFunctionManager().getFunctionCount() + " functions). " +
+                "Pass force=true to re-run analysis.";
+        }
+        final Program target = p;
+        runOnSwing(() -> {
+            // Mirrors AutoAnalysisPlugin's own analyze action.
+            mgr.initializeOptions();
+            tool.executeBackgroundCommand(new AnalysisBackgroundCommand(mgr, true), target);
+            mgr.reAnalyzeAll(null);
+        });
+        analysisStarts.put(programPath(target), new AnalysisRun());
+        return "Analysis started for " + target.getName() + " (path=" + programPath(target) +
+            "). Poll analysis_status until state=done, then call save_program to keep the results.";
+    }
+
+    /** Progress of an auto-analysis run: state=starting|running|done|idle. */
+    private String analysisStatus(String name) {
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm == null) return "No program manager available";
+        Program p = (name == null || name.isEmpty())
+            ? getCurrentProgram() : findOpenProgram(pm, name);
+        if (p == null) return "Error: no open program matches '" + name + "'";
+
+        AnalysisRun run = analysisStarts.get(programPath(p));
+        boolean running = AutoAnalysisManager.getAnalysisManager(p).isAnalyzing();
+        long now = System.currentTimeMillis();
+        String state;
+        String elapsed = "?";
+        if (run == null) {
+            // Nothing was started through MCP; the GUI may still be analyzing.
+            state = running ? "running" : "idle";
+        }
+        else {
+            if (running) {
+                run.sawRunning = true;
+                state = "running";
+            }
+            else if (!run.sawRunning && now - run.start < STARTUP_GRACE_MS) {
+                state = "starting";     // queued but the background task has not begun yet
+            }
+            else {
+                if (run.end == 0) run.end = now;
+                state = "done";
+            }
+            elapsed = ((run.end > 0 ? run.end : now) - run.start) / 1000 + "s";
+        }
+        return String.format("%s\tstate=%s\telapsed=%s\tanalyzed=%s\tfunctions=%d\tmodified=%s",
+            p.getName(), state, elapsed, GhidraProgramUtilities.isAnalyzed(p),
+            p.getFunctionManager().getFunctionCount(), p.isChanged());
+    }
+
+    /** Write pending changes of a program back to the project. */
+    private String saveProgram(String name) {
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm == null) return "No program manager available";
+        Program p = (name == null || name.isEmpty())
+            ? getCurrentProgram() : findOpenProgram(pm, name);
+        if (p == null) return "Error: no open program matches '" + name + "'";
+        if (!p.isChanged()) return "No changes to save for " + p.getName();
+        final Program target = p;
+        runOnSwing(() -> pm.saveProgram(target));
+        return target.isChanged()
+            ? "Error: save of " + target.getName() + " did not complete"
+            : "Saved " + target.getName();
+    }
+
+    /** Close a program that was opened in the background, freeing its memory. */
+    private String closeProgram(String name) {
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm == null) return "No program manager available";
+        Program p = (name == null || name.isEmpty())
+            ? getCurrentProgram() : findOpenProgram(pm, name);
+        if (p == null) return "Error: no open program matches '" + name + "'";
+        String path = programPath(p);
+        if (!hiddenOpenedPaths.contains(path)) {
+            return "Error: " + p.getName() + " was opened in the Ghidra GUI, not by MCP. " +
+                "Close it from the GUI instead.";
+        }
+        if (p.isChanged()) {
+            return "Error: " + p.getName() + " has unsaved changes. Call save_program first, " +
+                "or close it from the Ghidra GUI to discard them.";
+        }
+        final Program target = p;
+        String closedName = p.getName();
+        AtomicBoolean closed = new AtomicBoolean(false);
+        runOnSwing(() -> closed.set(pm.closeProgram(target, true)));
+        if (!closed.get()) return "Error: failed to close " + closedName;
+        hiddenOpenedPaths.remove(path);
+        if (closedName.equals(selectedProgramName)) {
+            selectedProgramName = null;     // stop auto-reopening what we just closed
+        }
+        return "Closed " + closedName;
     }
 
     private void sendResponse(HttpExchange exchange, String response) throws IOException {

@@ -7,6 +7,7 @@
 # ///
 
 import sys
+import time
 import requests
 import argparse
 import logging
@@ -290,20 +291,22 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list
 @mcp.tool()
 def list_programs() -> list:
     """
-    List every program currently open in the Ghidra project (e.g. the host CPU
-    binary and each device GPU cubin). The program the MCP tools currently act on
-    is marked with '*'. Each line gives the program name, its processor language,
-    and its project path. Use this to discover the host and device programs before
-    switching between them with use_program.
+    List every program in the Ghidra project (e.g. the host CPU binary and each device
+    GPU cubin), whether or not it is open in the Ghidra GUI. The program the MCP tools
+    currently act on is marked with '*'. Each line gives the program name, its state
+    (open = open in the GUI, background = opened by MCP, closed = in the project only),
+    its processor language, and its project path. Programs that are merely in the
+    project can be selected directly with use_program - no need to open them by hand.
     """
     return safe_get("list_programs")
 
 @mcp.tool()
 def use_program(name: str) -> str:
     """
-    Switch which open program all other MCP tools operate on. Pass a program name
-    exactly as shown by list_programs (the host binary, or a device .cubin). This is
-    required to analyze host and device code in the same session: select the host
+    Switch which program all other MCP tools operate on. Pass a program name or project
+    path exactly as shown by list_programs (the host binary, or a device .cubin). If the
+    program is in the project but not open, it is opened in the background automatically.
+    This is required to analyze host and device code in the same session: select the host
     program to inspect CPU-side allocation/launch code, then select a device cubin to
     inspect the GPU kernel disassembly.
     """
@@ -313,9 +316,63 @@ def use_program(name: str) -> str:
 def get_current_program() -> str:
     """
     Show which program the MCP tools are currently operating on (name, processor
-    language, and project path).
+    language, project path, and whether it has unsaved changes).
     """
     return "\n".join(safe_get("get_current_program"))
+
+@mcp.tool()
+def analyze_program(name: str = "", force: bool = False, wait_seconds: int = 600) -> str:
+    """
+    Run Ghidra's auto-analysis on a program. Needed for a program that list_programs shows
+    with few or no functions: files imported into the project but never analyzed contain no
+    functions until this runs. Defaults to the currently selected program; pass a name from
+    list_programs to analyze another one (it is opened from the project if needed). Analysis
+    already done is skipped unless force=True. This waits up to wait_seconds for analysis to
+    finish and returns the final status (analysis of a large binary can take many minutes);
+    set wait_seconds=0 to return immediately and poll analysis_status yourself. Call
+    save_program afterwards to write the results back to the project file.
+    """
+    started = "\n".join(safe_get("analyze_program", {"name": name, "force": str(force).lower()}))
+    if wait_seconds <= 0 or not started.startswith("Analysis started"):
+        return started
+
+    deadline = time.time() + wait_seconds
+    status = ""
+    while time.time() < deadline:
+        time.sleep(3)
+        status = "\n".join(safe_get("analysis_status", {"name": name}))
+        if "state=running" not in status and "state=starting" not in status:
+            return f"{started}\n{status}"
+    return (f"{started}\n{status}\nStill running after {wait_seconds}s - "
+            "keep polling with analysis_status.")
+
+@mcp.tool()
+def analysis_status(name: str = "") -> str:
+    """
+    Report auto-analysis progress for a program: state (starting/running/done/idle), elapsed
+    time, whether the program is marked analyzed, its current function count, and whether it
+    has unsaved changes. Defaults to the currently selected program.
+    """
+    return "\n".join(safe_get("analysis_status", {"name": name}))
+
+@mcp.tool()
+def save_program(name: str = "") -> str:
+    """
+    Write pending changes (renames, comments, retyped variables) back to the project
+    file. Defaults to the program currently selected with use_program. Programs opened
+    in the background by use_program are not visible in the Ghidra GUI, so save them
+    explicitly when a round of edits is finished.
+    """
+    return "\n".join(safe_get("save_program", {"name": name}))
+
+@mcp.tool()
+def close_program(name: str = "") -> str:
+    """
+    Close a program that use_program opened in the background, freeing its memory.
+    Defaults to the currently selected program. Fails if the program has unsaved changes
+    (call save_program first) or if it was opened in the Ghidra GUI by the user.
+    """
+    return "\n".join(safe_get("close_program", {"name": name}))
 
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
