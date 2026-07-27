@@ -52,3 +52,7 @@ replay_pid*
 # Third party JAR files from Ghidra
 lib/*.jar
 
+# Python bytecode
+__pycache__/
+*.py[cod]
+

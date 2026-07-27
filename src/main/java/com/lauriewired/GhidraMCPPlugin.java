@@ -68,6 +68,9 @@ import java.util.concurrent.atomic.AtomicBoolean;
 public class GhidraMCPPlugin extends Plugin {
 
     private HttpServer server;
+    // Name of the program the MCP tools should operate on, chosen via /use_program.
+    // null => fall back to the tool's GUI-current program (original behaviour).
+    private volatile String selectedProgramName = null;
     private static final String OPTION_CATEGORY_NAME = "GhidraMCP HTTP Server";
     private static final String PORT_OPTION_NAME = "Server Port";
     private static final int DEFAULT_PORT = 8080;
@@ -209,6 +212,21 @@ public class GhidraMCPPlugin extends Plugin {
 
         server.createContext("/list_functions", exchange -> {
             sendResponse(exchange, listFunctions());
+        });
+
+        // Multi-program support: enumerate open programs and choose which one the
+        // other tools act on (host binary vs. device cubin, for host-device analysis).
+        server.createContext("/list_programs", exchange -> {
+            sendResponse(exchange, listPrograms());
+        });
+
+        server.createContext("/use_program", exchange -> {
+            Map<String, String> qparams = parseQueryParams(exchange);
+            sendResponse(exchange, useProgram(qparams.get("name")));
+        });
+
+        server.createContext("/get_current_program", exchange -> {
+            sendResponse(exchange, getCurrentProgramInfo());
         });
 
         server.createContext("/decompile_function", exchange -> {
@@ -1626,7 +1644,73 @@ public class GhidraMCPPlugin extends Plugin {
 
     public Program getCurrentProgram() {
         ProgramManager pm = tool.getService(ProgramManager.class);
-        return pm != null ? pm.getCurrentProgram() : null;
+        if (pm == null) return null;
+        String sel = selectedProgramName;
+        if (sel != null && !sel.isEmpty()) {
+            for (Program p : pm.getAllOpenPrograms()) {
+                if (programMatches(p, sel)) return p;
+            }
+            // The selected program is no longer open; fall back to the GUI current.
+        }
+        return pm.getCurrentProgram();
+    }
+
+    /** Match an open program by exact name, exact project path, or (last resort)
+     *  a name substring, so callers can use whatever list_programs shows. */
+    private boolean programMatches(Program p, String sel) {
+        if (p.getName().equals(sel)) return true;
+        try {
+            if (p.getDomainFile() != null && p.getDomainFile().getPathname().equals(sel)) return true;
+        } catch (Exception e) { /* ignore */ }
+        return p.getName().contains(sel);
+    }
+
+    private String programPath(Program p) {
+        try {
+            if (p.getDomainFile() != null) return p.getDomainFile().getPathname();
+        } catch (Exception e) { /* ignore */ }
+        return "";
+    }
+
+    /** List every open program; the MCP-active one is marked with '*'. */
+    private String listPrograms() {
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm == null) return "No program manager available";
+        Program[] all = pm.getAllOpenPrograms();
+        if (all == null || all.length == 0) return "No programs open";
+        Program active = getCurrentProgram();
+        StringBuilder sb = new StringBuilder();
+        for (Program p : all) {
+            sb.append(String.format("%s%s\tlang=%s\tpath=%s%n",
+                p == active ? "* " : "  ",
+                p.getName(),
+                p.getLanguageID().getIdAsString(),
+                programPath(p)));
+        }
+        return sb.toString();
+    }
+
+    /** Choose which open program the other tools operate on. */
+    private String useProgram(String name) {
+        if (name == null || name.isEmpty()) return "Error: missing 'name' parameter";
+        ProgramManager pm = tool.getService(ProgramManager.class);
+        if (pm == null) return "No program manager available";
+        for (Program p : pm.getAllOpenPrograms()) {
+            if (programMatches(p, name)) {
+                selectedProgramName = p.getName();   // canonicalise to the exact name
+                pm.setCurrentProgram(p);             // keep the GUI in sync
+                return String.format("Now using program: %s (lang=%s, path=%s)",
+                    p.getName(), p.getLanguageID().getIdAsString(), programPath(p));
+            }
+        }
+        return "Error: no open program matches '" + name + "'. Use list_programs to see options.";
+    }
+
+    private String getCurrentProgramInfo() {
+        Program p = getCurrentProgram();
+        if (p == null) return "No program loaded";
+        return String.format("%s\tlang=%s\tpath=%s",
+            p.getName(), p.getLanguageID().getIdAsString(), programPath(p));
     }
 
     private void sendResponse(HttpExchange exchange, String response) throws IOException {

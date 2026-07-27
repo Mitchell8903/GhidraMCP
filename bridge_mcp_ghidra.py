@@ -287,6 +287,36 @@ def list_strings(offset: int = 0, limit: int = 2000, filter: str = None) -> list
         params["filter"] = filter
     return safe_get("strings", params)
 
+@mcp.tool()
+def list_programs() -> list:
+    """
+    List every program currently open in the Ghidra project (e.g. the host CPU
+    binary and each device GPU cubin). The program the MCP tools currently act on
+    is marked with '*'. Each line gives the program name, its processor language,
+    and its project path. Use this to discover the host and device programs before
+    switching between them with use_program.
+    """
+    return safe_get("list_programs")
+
+@mcp.tool()
+def use_program(name: str) -> str:
+    """
+    Switch which open program all other MCP tools operate on. Pass a program name
+    exactly as shown by list_programs (the host binary, or a device .cubin). This is
+    required to analyze host and device code in the same session: select the host
+    program to inspect CPU-side allocation/launch code, then select a device cubin to
+    inspect the GPU kernel disassembly.
+    """
+    return "\n".join(safe_get("use_program", {"name": name}))
+
+@mcp.tool()
+def get_current_program() -> str:
+    """
+    Show which program the MCP tools are currently operating on (name, processor
+    language, and project path).
+    """
+    return "\n".join(safe_get("get_current_program"))
+
 def main():
     parser = argparse.ArgumentParser(description="MCP server for Ghidra")
     parser.add_argument("--ghidra-server", type=str, default=DEFAULT_GHIDRA_SERVER,
